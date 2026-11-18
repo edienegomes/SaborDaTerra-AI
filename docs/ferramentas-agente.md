@@ -11,7 +11,7 @@ Este documento explica como consultar os dados estruturados pelo módulo `sabor_
 
 O despacho recebe uma chamada estruturada; ele não interpreta mensagens em linguagem natural nem decide a alocação de pedidos.
 
-## Ferramentas disponíveis
+## Consultas tabulares do despacho local
 
 | Nome | Argumentos obrigatórios | Uso |
 |---|---|---|
@@ -23,9 +23,9 @@ As três consultas estruturadas usam os CSVs locais. Preços e pagamentos são d
 
 ## Adaptador para descoberta pelo agente
 
-A branch Cloud configura o módulo `sabor_agentes.tool`. Esse adaptador publica em `TOOLS` somente as três funções deste escopo: `get_producer_summary`, `lookup_price` e `lookup_lot`. As funções têm parâmetros tipados, docstrings de uso e retornos estruturados; elas delegam as consultas ao pacote `sabor_agent.data_tools`.
+A branch Cloud configura o módulo `sabor_agentes.tool`. Esse adaptador publica em `TOOLS` quatro funções tipadas, documentadas e com retornos estruturados: `get_producer_summary`, `lookup_price`, `lookup_lot` e `draft_producer_order_notifications`. As três consultas tabulares delegam ao pacote `sabor_agent.data_tools`; a ferramenta de pedidos delega a `sabor_agent.notifications`. O `dispatch_tool` local continua oferecendo somente as três consultas tabulares.
 
-O caminho padrão dos CSVs continua configurado internamente em `sabor_agent.data_tools` (`source/Facepe/`). O adaptador não recebe caminho de arquivo como argumento, então o modelo não pode escolher diretórios ou arquivos.
+O caminho padrão dos CSVs está configurado internamente em `sabor_agent.data_tools` (`data/processed/raw/documents/dados_csv/`), conforme a branch `integracao`. O adaptador não recebe caminho de arquivo como argumento, então o modelo não pode escolher diretórios ou arquivos.
 
 ### Resumo individual do produtor
 
@@ -63,7 +63,7 @@ summary = get_producer_summary("P001", "2026-10-01", "2026-10-31")
 pagamentos_pendentes = summary["payments"]["pending"]
 ```
 
-`lookup_price` mantém `matches` e `suggestions` separados e não escolhe variantes. O formatador de notificação ainda não aparece em `TOOLS`: ele depende de uma fonte de alocação confirmada.
+`lookup_price` mantém `matches` e `suggestions` separados e não escolhe variantes. `draft_producer_order_notifications` também está em `TOOLS`; recebe o resultado estruturado da triagem, aloca somente correspondências sem ambiguidade e prepara rascunhos por produtor.
 
 ## Comportamento esperado das respostas
 
@@ -96,7 +96,14 @@ pagamentos_pendentes = summary["payments"]["pending"]
 
 ### Rascunho de notificação ao produtor
 
-`format_producer_order_notification` é um formatador local que recebe o nome de um produtor e uma lista explícita de itens já alocados a ele. Cada item contém `product`, `quantity` e `unit`. A função não define como os itens foram alocados, não escolhe produtores, não interpreta a mensagem do comprador e não envia a notificação.
+`format_producer_order_notification` é o formatador local. `build_producer_order_notifications` recebe o objeto estruturado retornado pela triagem, consulta `produtores.csv` e gera os rascunhos. O fluxo não interpreta a mensagem original e não envia mensagens.
+
+- Só processa pedidos com status `pronto`; `revisar` e `bloqueado` não geram rascunhos.
+- Compara o produto triado com a lista `produtos` do cadastro, considerando apenas produtores `ativos`. Para itens `organico`, exige `certificacao_organica = sim` e `validade_certificacao` igual ou posterior à data estimada de entrega (`prazo.data_estimada`).
+- Sem data estimada, o item orgânico fica pendente. Certificado vencido não é elegível; certificado ausente ou inválido gera erro de validação da base, em vez de alocação presumida.
+- Aloca automaticamente apenas quando há exatamente um candidato. Sem candidato ou com vários, devolve o item em `unresolved_items` para revisão; não presume estoque nem capacidade de entrega.
+- Para alocações parciais, produz rascunhos somente para os itens que tiveram um único produtor elegível. Cada produtor recebe um rascunho agrupado com seus itens.
+- Não usa dados de contato, CPF, dados bancários, chave Pix ou informações pessoais do comprador. O retorno é JSON com `drafts`, `unresolved_items`, `status` e `allocation_status`.
 
 ```text
 Olá, [nome do produtor]!
@@ -110,26 +117,33 @@ Referência: [identificador do pedido, se disponível]
 [instrução de confirmação, se definida pela cooperativa]
 ```
 
-Se não houver alocação confirmada, produto, quantidade ou prazo necessários, não produzir uma mensagem pronta para envio: informar quais dados faltam. O resultado é somente um rascunho; canal, destinatário e envio dependem de definições e integração próprias. Não incluir CPF, dados bancários, chave Pix ou dados pessoais do comprador.
+Se o pedido não estiver pronto, ou se faltar produto, quantidade, unidade ou um produtor único elegível, não produzir rascunho para o item; devolver a lacuna em `unresolved_items`. O resultado é somente um rascunho. A ferramenta não consulta contato, não escolhe canal e não envia mensagens. Não incluir CPF, dados bancários, chave Pix ou dados pessoais do comprador.
 
-Exemplo com valores ilustrativos; quem chama a função deve substituir os valores pelos dados da alocação confirmada:
+Exemplo com um pedido triado estruturado. `comprador` pode estar presente no objeto de origem, mas seus dados não são copiados para o rascunho:
 
 ```python
-from sabor_agent import format_producer_order_notification
+from sabor_agentes.tool import draft_producer_order_notifications
 
-draft = format_producer_order_notification(
-    producer_name="Nome confirmado do produtor",
-    allocated_items=[
-        {"product": "queijo coalho", "quantity": "30", "unit": "kg"},
-        {"product": "manteiga de garrafa", "quantity": "10", "unit": "kg"},
-    ],
-    delivery_deadline="sexta-feira",
-    order_reference="PED-EXEMPLO-001",
-    confirmation_instruction="Confirme o recebimento deste aviso.",
+resultado = draft_producer_order_notifications(
+    {
+        "pedido_id": "PED-EXEMPLO-001",
+        "status": "pronto",
+        "itens": [
+            {
+                "produto": "queijo coalho",
+                "quantidade": 30,
+                "unidade": "kg",
+                "producao": "convencional",
+            }
+        ],
+        "prazo": {"data_estimada": "2026-11-21"},
+    }
 )
+rascunhos = resultado["drafts"]
+itens_pendentes = resultado["unresolved_items"]
 ```
 
-O formatador é um helper e ainda não foi registrado como ferramenta do modelo: a integração só deve fornecê-lo ao agente quando houver uma fonte definida para a alocação confirmada.
+O helper `format_producer_order_notification` continua disponível para formatação direta quando a alocação já foi informada por outro chamador. A ferramenta registrada executa a consulta conservadora do cadastro antes de chamar esse helper.
 
 ## Exemplos de respostas esperadas
 
@@ -138,7 +152,7 @@ O formatador é um helper e ainda não foi registrado como ferramenta do modelo:
 - **Busca de preço com variantes:** “Não encontrei correspondência exata para [consulta]. Variantes disponíveis: [lista com nomes completos e valores da fonte].” A ferramenta não escolhe uma variante.
 - **Busca de preço sem resultado:** “Não encontrei [produto] na tabela de preços de outubro de 2026.”
 - **Lote inexistente:** “Lote não encontrado.”
-- **Pedido sem alocação confirmada:** não escolher produtores nem preparar uma notificação direcionada. O formato e o momento de comunicar essa ausência dependem do contrato com Triagem/Alocação e do comportamento conversacional.
+- **Pedido em revisão/bloqueado, item sem produtor ou com vários candidatos:** não gerar rascunho para esse item; retornar o motivo e os candidatos elegíveis, quando houver, em `unresolved_items`.
 
 ## Chamar as ferramentas em Python
 
@@ -184,7 +198,7 @@ summary = dispatch_tool(
         "start_date": "2026-09-01",
         "end_date": "2026-10-31",
     },
-    data_dir="caminho/para/Facepe",
+    data_dir="caminho/para/dados_csv",
 )
 ```
 
@@ -204,12 +218,12 @@ O script chama as três ferramentas tabulares e imprime seus resultados em JSON.
 python -m scripts.demo_data_tools --help
 ```
 
-Por padrão, os CSVs são lidos de `source/Facepe/`. `source/` é local e deve permanecer ignorada pelo Git; o conjunto de dados não é incluído no repositório. Se os CSVs não estiverem nessa pasta, passe outro caminho com `--data-dir`.
+Por padrão, os CSVs são lidos de `data/processed/raw/documents/dados_csv/`, presente na branch `integracao`. Em uma branch/checkout que ainda não recebeu essa pasta, use `--data-dir source/Facepe` para executar a demonstração com os arquivos locais. `source/` deve permanecer ignorada pelo Git e seus dados não devem ser enviados ao repositório.
 
 ## Testes locais
 
-Para executar os testes das consultas, despacho, formatadores e adaptador Cloud:
+Para executar os testes das consultas, despacho, formatação, alocação de pedidos e adaptador Cloud:
 
 ```powershell
-python -m pytest tests/test_data_tools.py tests/test_orchestrator.py tests/test_formatters.py tests/test_sabor_agentes_tool.py -q
+python -m pytest tests/test_data_tools.py tests/test_orchestrator.py tests/test_formatters.py tests/test_order_notifications.py tests/test_sabor_agentes_tool.py -q
 ```

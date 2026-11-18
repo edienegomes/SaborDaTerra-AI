@@ -7,7 +7,14 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "source" / "Facepe"
+DEFAULT_DATA_DIR = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "processed"
+    / "raw"
+    / "documents"
+    / "dados_csv"
+)
 PRICE_PERIOD = "2026-10"
 
 
@@ -103,6 +110,73 @@ def get_producer_summary(
         },
         "source_file": "financeiro.csv",
     }
+
+
+def find_producer_candidates(
+    product: str,
+    *,
+    organic_only: bool = False,
+    delivery_date: date | str | None = None,
+    data_dir: str | Path = DEFAULT_DATA_DIR,
+) -> list[dict[str, str]]:
+    """Retorna produtores ativos cadastrados para um produto exato.
+
+    Quando ``organic_only`` é verdadeiro, exige ``certificacao_organica`` igual
+    a ``sim`` e um certificado válido até ``delivery_date``. A consulta não
+    verifica estoque nem capacidade de entrega.
+    """
+    normalized_product = _normalize_product(product)
+    if not normalized_product:
+        raise DataValidationError("product não pode estar vazio.")
+
+    delivery = None
+    if organic_only:
+        delivery = _parse_date(delivery_date, "delivery_date")
+
+    required_fields = {"id", "nome_completo", "produtos", "certificacao_organica", "status"}
+    if organic_only:
+        required_fields.add("validade_certificacao")
+    producers = _read_csv(Path(data_dir) / "produtores.csv", required_fields)
+    producer_ids = [
+        _normalize_identifier(row.get("id"), "produtores.id") for row in producers
+    ]
+    if len(producer_ids) != len(set(producer_ids)):
+        raise DataValidationError("produtores.csv contém IDs duplicados.")
+
+    matches = []
+    for row_number, row in enumerate(producers, start=2):
+        if _normalize_text(row.get("status") or "") != "ativo":
+            continue
+        products = set()
+        for item in (row.get("produtos") or "").split(","):
+            normalized_item = _normalize_product(item)
+            if normalized_item:
+                products.add(normalized_item)
+        if normalized_product not in products:
+            continue
+        if organic_only:
+            if _normalize_text(row.get("certificacao_organica") or "") != "sim":
+                continue
+            certificate_expiry = _parse_date(
+                row.get("validade_certificacao"),
+                f"produtores.csv linha {row_number}, validade_certificacao",
+            )
+            if certificate_expiry < delivery:
+                continue
+
+        producer_name = _optional_value(row.get("nome_completo"))
+        if not producer_name:
+            raise DataValidationError(
+                "produtores.csv contém um produtor ativo sem nome cadastrado."
+            )
+        matches.append(
+            {
+                "producer_id": row["id"].strip(),
+                "producer_name": producer_name,
+            }
+        )
+
+    return matches
 
 
 def lookup_price(

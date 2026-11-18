@@ -9,7 +9,9 @@ def test_tool_module_exposes_only_typed_documented_agent_tools():
         tool.get_producer_summary,
         tool.lookup_price,
         tool.lookup_lot,
+        getattr(tool, "draft_producer_order_notifications", None),
     ]
+    assert callable(getattr(tool, "draft_producer_order_notifications", None))
 
     for function in tool.TOOLS:
         assert function.__module__ == tool.__name__
@@ -19,6 +21,16 @@ def test_tool_module_exposes_only_typed_documented_agent_tools():
             for parameter in inspect.signature(function).parameters.values()
         )
         assert inspect.signature(function).return_annotation is dict
+
+    order_type = inspect.signature(
+        tool.draft_producer_order_notifications
+    ).parameters["order"].annotation
+    assert set(order_type.__annotations__) == {
+        "pedido_id",
+        "status",
+        "itens",
+        "prazo",
+    }
 
 
 def test_producer_summary_tool_forwards_one_producer_and_period(monkeypatch):
@@ -88,3 +100,20 @@ def test_lot_tool_returns_a_json_serializable_not_found_envelope(monkeypatch):
 
     assert result == {"found": False, "lot_id": "LOT-MISSING", "lot": None}
     assert json.loads(json.dumps(result)) == result
+
+
+def test_notification_tool_forwards_structured_triaged_order(monkeypatch):
+    expected = {"allocation_status": "complete", "drafts": [], "unresolved_items": []}
+    calls = []
+    order = {"status": "pronto", "itens": []}
+
+    def fake_draft(order_value):
+        calls.append(order_value)
+        return expected
+
+    monkeypatch.setattr(tool, "_build_producer_order_notifications", fake_draft)
+
+    result = tool.draft_producer_order_notifications(order)
+
+    assert calls == [order]
+    assert result is expected
